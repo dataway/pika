@@ -14,6 +14,7 @@ import pika.spec as spec
 from pika.adapters import BaseConnection
 from pika.channel import Channel, ChannelTransport
 from pika.exceptions import AMQPConnectionError, AMQPChannelError
+from pika.callback import _name_or_value
 
 SOCKET_TIMEOUT = 0.25
 SOCKET_TIMEOUT_THRESHOLD = 100
@@ -36,13 +37,22 @@ class BlockingConnection(BaseConnection):
         BaseConnection._adapter_connect(self)
         self.socket.setblocking(1)
         # Set the timeout for reading/writing on the socket
-        self.socket.settimeout(SOCKET_TIMEOUT)
+        self.socket.settimeout(paramaters.socket_timeout or SOCKET_TIMEOUT)
         self._socket_timeouts = 0
         self._on_connected()
         self._timeouts = dict()
-        while not self.is_open:
+
+        # When using a high availability cluster (such as HAProxy) we are always able to connect
+        # even though there might be no RabbitMQ backend. 
+        socket_timeout_retries = 0
+        while not self.is_open and socket_timeout_retries<SOCKET_TIMEOUT_THRESHOLD:
             self._flush_outbound()
             self._handle_read()
+            timeout_retries +=1
+
+        if not self.is_open:
+            raise AMQPConnectionError("No connection could be opened after %s retries" % SOCKET_TIMEOUT_THRESHOLD)
+
         return self
 
     def close(self, code=200, text='Normal shutdown'):
@@ -84,6 +94,15 @@ class BlockingConnection(BaseConnection):
             if self._socket_timeouts > SOCKET_TIMEOUT_THRESHOLD:
                 log.error(SOCKET_TIMEOUT_MESSAGE)
                 self._handle_disconnect()
+
+    def flush_outbound(self):
+        # Make sure we're open, if not raise the exception
+        if not self.is_open and not self.is_closing:
+            raise AMQPConnectionError
+        # Write our data
+        self._flush_outbound()
+        # Process our timeout events
+        self.process_timeouts()
 
     def process_data_events(self):
         # Make sure we're open, if not raise the exception
@@ -173,11 +192,11 @@ class BlockingChannelTransport(ChannelTransport):
         self._wait = False
 
     def add_reply(self, reply):
-        reply = self.callbacks.sanitize(reply)
+        reply = _name_or_value(reply)
         self._replies.append(reply)
 
     def remove_reply(self, frame):
-        key = self.callbacks.sanitize(frame)
+        key = _name_or_value(frame)
         if key in self._replies:
             self._replies.remove(key)
 
@@ -227,7 +246,7 @@ class BlockingChannelTransport(ChannelTransport):
                 return frame
 
     def _on_rpc_complete(self, frame):
-        key = self.callbacks.sanitize(frame)
+        key = _name_or_value(frame)
         self._replies.append(key)
         self._frames[key] = frame
         self._received_response = True
@@ -244,7 +263,7 @@ class BlockingChannelTransport(ChannelTransport):
         # Wait until the outbound buffer is empty
         while self.connection.outbound_buffer.size > 0:
             try:
-                self.connection.process_data_events()
+                self.connection.flush_outbound()
             except AMQPConnectionError:
                 break
 
