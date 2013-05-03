@@ -1,12 +1,6 @@
-# ***** BEGIN LICENSE BLOCK *****
-#
-# For copyright and licensing please refer to COPYING.
-#
-# ***** END LICENSE BLOCK *****
-"""
-Using Pika with a Twisted reactor.
+"""Using Pika with a Twisted reactor.
 
-Supports two methods of estabilishing the connection, using TwistedConnection
+Supports two methods of establishing the connection, using TwistedConnection
 or TwistedProtocolConnection. For details about each method, see the docstrings
 of the corresponding classes.
 
@@ -16,14 +10,14 @@ Deferreds instead of taking a callback argument and that basic_consume()
 returns a Twisted DeferredQueue where messages from the server will be
 stored. Refer to the docstrings for TwistedConnection.channel() and the
 TwistedChannel class for details.
+
 """
 import functools
-import time
 from twisted.internet import defer, error, reactor
 from twisted.python import log
 
 from pika import exceptions
-from pika.adapters.base_connection import BaseConnection, READ, WRITE
+from pika.adapters import base_connection
 
 
 class ClosableDeferredQueue(defer.DeferredQueue):
@@ -34,7 +28,7 @@ class ClosableDeferredQueue(defer.DeferredQueue):
     """
     def __init__(self, size=None, backlog=None):
         self.closed = None
-        defer.DeferredQueue.__init__(self, size, backlog)
+        super(ClosableDeferredQueue, self).__init__(size, backlog)
 
     def put(self, obj):
         if self.closed:
@@ -54,8 +48,7 @@ class ClosableDeferredQueue(defer.DeferredQueue):
 
 
 class TwistedChannel(object):
-    """
-    A wrapper wround Pika's Channel.
+    """A wrapper wround Pika's Channel.
 
     Channel methods that are normally take a callback argument are wrapped to
     return a Deferred that fires with whatever would be passed to the callback.
@@ -81,9 +74,9 @@ class TwistedChannel(object):
 
         channel.add_on_close_callback(self.channel_closed)
 
-    def channel_closed(self, code, text):
+    def channel_closed(self, channel, reply_code, reply_text):
         # enter the closed state
-        self.__closed = exceptions.ChannelClosed(code, text)
+        self.__closed = exceptions.ChannelClosed(reply_code, reply_text)
         # errback all pending calls
         for d in self.__calls:
             d.errback(self.__closed)
@@ -96,8 +89,7 @@ class TwistedChannel(object):
         self.__consumers = {}
 
     def basic_consume(self, *args, **kwargs):
-        """
-        Consume from a server queue. Returns a Deferred that fires with a
+        """Consume from a server queue. Returns a Deferred that fires with a
         tuple: (queue_object, consumer_tag). The queue object is an instance of
         ClosableDeferredQueue, where data received from the queue will be
         stored. Clients should use its get() method to fetch individual
@@ -119,9 +111,9 @@ class TwistedChannel(object):
         return defer.succeed((queue, consumer_tag))
 
     def queue_delete(self, *args, **kwargs):
-        """
-        Wraps the method the same way all the others are wrapped, but removes
+        """Wraps the method the same way all the others are wrapped, but removes
         the reference to the queue object after it gets deleted on the server.
+
         """
         wrapped = self.__wrap_channel_method('queue_delete')
         queue_name = kwargs['queue']
@@ -130,20 +122,20 @@ class TwistedChannel(object):
         return d.addCallback(self.__clear_consumer, queue_name)
 
     def basic_publish(self, *args, **kwargs):
-        """
-        Make sure the channel is not closed and then publish. Return a Deferred
-        that fires with the result of the channel's basic_publish.
+        """Make sure the channel is not closed and then publish. Return a
+        Deferred that fires with the result of the channel's basic_publish.
+
         """
         if self.__closed:
             return defer.fail(self.__closed)
         return defer.succeed(self.__channel.basic_publish(*args, **kwargs))
 
     def __wrap_channel_method(self, name):
-        """
-        Wrap Pika's Channel method to make it return a Deferred that fires when
-        the method completes and errbacks if the channel gets closed. If the
-        original method's callback would receive more than one argument, the
+        """Wrap Pika's Channel method to make it return a Deferred that fires
+        when the method completes and errbacks if the channel gets closed. If
+        the original method's callback would receive more than one argument, the
         Deferred fires with a tuple of argument values.
+
         """
         method = getattr(self.__channel, name)
 
@@ -182,21 +174,35 @@ class TwistedChannel(object):
 
 
 class IOLoopReactorAdapter(object):
-    """
-    An adapter providing Pika's IOLoop interface using a Twisted reactor.
+    """An adapter providing Pika's IOLoop interface using a Twisted reactor.
 
     Accepts a TwistedConnection object and a Twisted reactor object.
+
     """
     def __init__(self, connection, reactor):
         self.connection = connection
         self.reactor = reactor
         self.started = False
 
-    def add_timeout(self, deadline, callback):
-        secs = deadline - time.time()
-        return self.reactor.callLater(secs, callback)
+    def add_timeout(self, deadline, callback_method):
+        """Add the callback_method to the IOLoop timer to fire after deadline
+        seconds. Returns a handle to the timeout. Do not confuse with
+        Tornado's timeout where you pass in the time you want to have your
+        callback called. Only pass in the seconds until it's to be called.
+
+        :param int deadline: The number of seconds to wait to call callback
+        :param method callback_method: The callback method
+        :rtype: twisted.internet.interfaces.IDelayedCall
+
+        """
+        return self.reactor.callLater(deadline, callback_method)
 
     def remove_timeout(self, call):
+        """Remove a call
+
+        :param twisted.internet.interfaces.IDelayedCall call: The call to cancel
+
+        """
         call.cancel()
 
     def stop(self):
@@ -227,20 +233,19 @@ class IOLoopReactorAdapter(object):
         self.reactor.removeReader(self.connection)
         self.reactor.removeWriter(self.connection)
 
-        if event_state & READ:
+        if event_state & self.connection.READ:
             self.reactor.addReader(self.connection)
 
-        if event_state & WRITE:
+        if event_state & self.connection.WRITE:
             self.reactor.addWriter(self.connection)
 
 
-class TwistedConnection(BaseConnection):
-    """
-    A standard Pika connection adapter. You instantiate the class passing the
+class TwistedConnection(base_connection.BaseConnection):
+    """A standard Pika connection adapter. You instantiate the class passing the
     connection parameters and the connected callback and when it gets called
     you can start using it.
 
-    The problem is that connection estabilishing is done using the blocking
+    The problem is that connection establishing is done using the blocking
     socket module. For instance, if the host you are connecting to is behind a
     misconfigured firewall that just drops packets, the whole process will
     freeze until the connection timeout passes. To work around that problem,
@@ -250,49 +255,60 @@ class TwistedConnection(BaseConnection):
     when the socket connection becomes readable or writable, so apart from
     implementing the BaseConnection interface, they also provide Twisted's
     IReadWriteDescriptor interface.
+
     """
+    def __init__(self, parameters=None,
+                 on_open_callback=None,
+                 on_open_error_callback=None,
+                 on_close_callback=None,
+                 stop_ioloop_on_close=False):
+        super(TwistedConnection, self).__init__(
+            parameters=parameters,
+            on_open_callback=on_open_callback,
+            on_open_error_callback=on_open_error_callback,
+            on_close_callback=on_close_callback,
+            ioloop=IOLoopReactorAdapter(self, reactor),
+            stop_ioloop_on_close=stop_ioloop_on_close)
 
-    # BaseConnection methods
-
-    def _adapter_connect(self, host, port):
+    def _adapter_connect(self):
+        """Connect to the RabbitMQ broker"""
         # Connect (blockignly!) to the server
-        BaseConnection._adapter_connect(self, host, port)
-        # Pnce that's done, create an I/O loop by adapting the Twisted reactor
-        self.ioloop = IOLoopReactorAdapter(self, reactor)
-        # Set the I/O events we're waiting for (see IOLoopReactorAdapter
-        # docstrings for why it's OK to pass None as the file descriptor)
-        self.ioloop.update_handler(None, self.event_state)
-
-        # Let everyone know we're connected
-        self._on_connected()
+        if super(TwistedConnection, self)._adapter_connect():
+            # Set the I/O events we're waiting for (see IOLoopReactorAdapter
+            # docstrings for why it's OK to pass None as the file descriptor)
+            self.ioloop.update_handler(None, self.event_state)
+            return True
+        return False
 
     def _adapter_disconnect(self):
-        # Remove from the IOLoop
+        """Called when the adapter should disconnect"""
         self.ioloop.remove_handler(None)
-
-        # Close our socket since the Connection class told us to do so
         self.socket.close()
 
-    def _on_connected(self):
-        # Call superclass and then update the event state to flush the outgoing
-        # frame out. Commit 50d842526d9f12d32ad9f3c4910ef60b8c301f59 removed a
-        # self._flush_outbound call that was in _send_frame which previously
-        # made this step unnecessary.
-        BaseConnection._on_connected(self)
-        self._manage_event_state()
-
     def _handle_disconnect(self):
-        # Do not stop the reactor, this would cause the entire process to exit,
-        # just fire the disconnect callbacks
+        """Do not stop the reactor, this would cause the entire process to exit,
+        just fire the disconnect callbacks
+
+        """
         self._on_connection_closed(None, True)
 
-    def channel(self, channel_number=None):
+    def _on_connected(self):
+        """Call superclass and then update the event state to flush the outgoing
+        frame out. Commit 50d842526d9f12d32ad9f3c4910ef60b8c301f59 removed a
+        self._flush_outbound call that was in _send_frame which previously
+        made this step unnecessary.
+
         """
-        Return a Deferred that fires with an instance of a wrapper aroud the
+        super(TwistedConnection, self)._on_connected()
+        self._manage_event_state()
+
+    def channel(self, channel_number=None):
+        """Return a Deferred that fires with an instance of a wrapper around the
         Pika Channel class.
+
         """
         d = defer.Deferred()
-        BaseConnection.channel(self, d.callback, channel_number)
+        base_connection.BaseConnection.channel(self, d.callback, channel_number)
         return d.addCallback(TwistedChannel)
 
     # IReadWriteDescriptor methods
@@ -318,9 +334,8 @@ class TwistedConnection(BaseConnection):
         self._manage_event_state()
 
 
-class TwistedProtocolConnection(BaseConnection):
-    """
-    Ahybrid between a Pika Connection and a Twisted Protocol. Allows using
+class TwistedProtocolConnection(base_connection.BaseConnection):
+    """A hybrid between a Pika Connection and a Twisted Protocol. Allows using
     Twisted's non-blocking connectTCP/connectSSL methods for connecting to the
     server.
 
@@ -329,46 +344,67 @@ class TwistedProtocolConnection(BaseConnection):
     ready to be used (the initial AMQP handshaking has been done). You *have*
     to wait for this Deferred to fire before requesting a channel.
 
-    Since it's Twisted handling connection estabilishing, it does not accept
-    connect callbacks or reconnection strategy objects, you have to implement
-    that within Twisted. Also remember that the host, port and ssl values of
-    the connection parameters are ignored because, yet again, it's Twisted who
-    manages the connection.
+    Since it's Twisted handling connection establishing it does not accept
+    connect callbacks, you have to implement that within Twisted. Also remember
+    that the host, port and ssl values of the connection parameters are ignored
+    because, yet again, it's Twisted who manages the connection.
+
     """
-
-    # BaseConnection methods
-
     def __init__(self, parameters):
         self.ready = defer.Deferred()
-        BaseConnection.__init__(self, parameters, self.connectionReady)
-        self.ioloop = IOLoopReactorAdapter(self, reactor)
+        super(TwistedProtocolConnection, self).__init__(
+            parameters=parameters,
+            on_open_callback=self.connectionReady,
+            on_open_error_callback=self.connectionFailed,
+            on_close_callback=None,
+            ioloop=IOLoopReactorAdapter(self, reactor),
+            stop_ioloop_on_close=False)
+
+    def connect(self):
+        # The connection is open asynchronously by Twisted, so skip the whole
+        # connect() part, except for setting the connection state
+        self._set_connection_state(self.CONNECTION_INIT)
 
     def _adapter_connect(self):
-        # We get connected by Twisted, as is normal for protocols
-        pass
+        # Should never be called, as we override connect() and leave the
+        # building of a TCP connection to Twisted, but implement anyway to keep
+        # the interface
+        return False
 
     def _adapter_disconnect(self):
         # Disconnect from the server
         self.transport.loseConnection()
 
-    def _send_frame(self, frame):
-        marshalled_frame = frame.marshal()
-        self.bytes_sent += len(marshalled_frame)
+    def _send_frame(self, frame_value):
+        """Send data the Twisted way, by writing to the transport. No need for
+        buffering, Twisted handles that by itself.
+
+        :param frame_value: The frame to write
+        :type frame_value:  pika.frame.Frame|pika.frame.ProtocolHeader
+
+        """
+        if self.is_closed:
+            raise exceptions.ConnectionClosed
+        marshaled_frame = frame_value.marshal()
+        self.bytes_sent += len(marshaled_frame)
         self.frames_sent += 1
-
-        # XXX: no backpressure support yet
-
-        # Send data the Twisted way, by writing to the transport. No need for
-        # buffering, Twisted handles that by itself.
-        self.transport.write(marshalled_frame)
+        self.transport.write(marshaled_frame)
 
     def channel(self, channel_number=None):
-        """
-        Return a Deferred that fires with an instance of a wrapper aroud the
+        """Create a new channel with the next available channel number or pass
+        in a channel number to use. Must be non-zero if you would like to
+        specify but it is recommended that you let Pika manage the channel
+        numbers.
+
+        Return a Deferred that fires with an instance of a wrapper around the
         Pika Channel class.
+
+        :param int channel_number: The channel number to use, defaults to the
+                                   next available.
+
         """
         d = defer.Deferred()
-        BaseConnection.channel(self, d.callback, channel_number)
+        base_connection.BaseConnection.channel(self, d.callback, channel_number)
         return d.addCallback(TwistedChannel)
 
     # IProtocol methods
@@ -397,3 +433,10 @@ class TwistedProtocolConnection(BaseConnection):
         d, self.ready = self.ready, None
         if d:
             d.callback(res)
+
+    def connectionFailed(self, connection_unused):
+        d, self.ready = self.ready, None
+        if d:
+            attempts = self.params.connection_attempts
+            exc = exceptions.AMQPConnectionError(attempts)
+            d.errback(exc)
