@@ -1,8 +1,12 @@
 # Pika, an AMQP 0-9-1 client library for Python
 
+[![PyPI version](https://badge.fury.io/py/pika.png)](http://badge.fury.io/py/pika) [![Downloads](https://pypip.in/d/pika/badge.png)](https://crate.io/packages/pika) [![Build Status](https://travis-ci.org/pika/pika.png?branch=master)](https://travis-ci.org/pika/pika)
+
 ## Introduction
 Pika is a pure-Python implementation of the AMQP 0-9-1 protocol that tries
 to stay fairly independent of the underlying network support library.
+
+ * Currently supports Python 2.6 and Python 2.7 only. 3.2+ support planned.
 
  * Since threads aren't appropriate to every situation, it doesn't
    require threads. It takes care not to forbid them, either. The same
@@ -54,11 +58,10 @@ And an example of writing a blocking consumer:
  * BlockingConnection - enables blocking, synchronous operation on top of
                         library for simple uses
  * SelectConnection   - fast asynchronous adapter
+ * TwistedConnection  - adapter for use with the Twisted asynchronous package http://twistedmatrix.com/
  * TornadoConnection  - adapter for use with the Tornado IO Loop http://tornadoweb.org
+ * LibevConnection    - adapter for use with the libev event loop http://libev.schmorp.de
 
 ## License
-Pika is licensed under the MPL, and may also be used under the terms
-of the GPL. The full license text is included with the source code for
-the package in the LICENSE-GPL-2.0 and LICENSE-MPL-Pika files. If you
-have any questions regarding licensing, please contact the RabbitMQ team
-at <info@rabbitmq.com>.
+Pika is licensed under the MPLv2. If you have any questions regarding licensing,
+please contact the RabbitMQ team at <info@rabbitmq.com>.

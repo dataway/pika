@@ -24,6 +24,33 @@ class SelectConnection(BaseConnection):
     event loop adapter for the given platform.
 
     """
+
+    def __init__(self,
+                 parameters=None,
+                 on_open_callback=None,
+                 on_open_error_callback=None,
+                 on_close_callback=None,
+                 stop_ioloop_on_close=True):
+        """Create a new instance of the Connection object.
+
+        :param pika.connection.Parameters parameters: Connection parameters
+        :param method on_open_callback: Method to call on connection open
+        :param on_open_error_callback: Method to call if the connection cant
+                                       be opened
+        :type on_open_error_callback: method
+        :param method on_close_callback: Method to call on connection close
+        :param bool stop_ioloop_on_close: Call ioloop.stop() if disconnected
+        :raises: RuntimeError
+
+        """
+        ioloop = IOLoop(self._manage_event_state)
+        super(SelectConnection, self).__init__(parameters,
+                                               on_open_callback,
+                                               on_open_error_callback,
+                                               on_close_callback,
+                                               ioloop,
+                                               stop_ioloop_on_close)
+
     def _adapter_connect(self):
         """Connect to the RabbitMQ broker, returning True on success, False
         on failure.
@@ -31,13 +58,12 @@ class SelectConnection(BaseConnection):
         :rtype: bool
 
         """
-        if super(SelectConnection, self)._adapter_connect():
-            self.ioloop = IOLoop(self._manage_event_state)
+        error = super(SelectConnection, self)._adapter_connect()
+        if not error:
             self.ioloop.start_poller(self._handle_events,
                                      self.event_state,
                                      self.socket.fileno())
-            return True
-        return False
+        return error
 
     def _flush_outbound(self):
         """Call the state manager who will figure out that we need to write then
@@ -81,6 +107,9 @@ class IOLoop(object):
         :rtype: str
 
         """
+        if not self.poller:
+            time.sleep(deadline)
+            return callback_method()
         return self.poller.add_timeout(deadline, callback_method)
 
     @property
@@ -103,6 +132,7 @@ class IOLoop(object):
     def start(self):
         """Start the IOLoop, waiting for a Poller to take over."""
         LOGGER.debug('Starting IOLoop')
+        self.poller.open = True
         while not self.poller:
             time.sleep(SelectPoller.TIMEOUT)
         self.poller.start()
@@ -118,12 +148,7 @@ class IOLoop(object):
         """
         LOGGER.debug('Starting the Poller')
         self.poller = None
-        if hasattr(select, 'poll') and hasattr(select.poll, 'modify'):
-            if not SELECT_TYPE or SELECT_TYPE == 'poll':
-                LOGGER.debug('Using PollPoller')
-                self.poller = PollPoller(fileno, handler, events,
-                                         self._manage_event_state)
-        if not self.poller and hasattr(select, 'epoll'):
+        if hasattr(select, 'epoll'):
             if not SELECT_TYPE or SELECT_TYPE == 'epoll':
                 LOGGER.debug('Using EPollPoller')
                 self.poller = EPollPoller(fileno, handler, events,
@@ -133,6 +158,11 @@ class IOLoop(object):
                 LOGGER.debug('Using KQueuePoller')
                 self.poller = KQueuePoller(fileno, handler, events,
                                            self._manage_event_state)
+        if not self.poller and hasattr(select, 'poll') and hasattr(select.poll(), 'modify'):
+            if not SELECT_TYPE or SELECT_TYPE == 'poll':
+                LOGGER.debug('Using PollPoller')
+                self.poller = PollPoller(fileno, handler, events,
+                                         self._manage_event_state)
         if not self.poller:
             LOGGER.debug('Using SelectPoller')
             self.poller = SelectPoller(fileno, handler, events,
@@ -224,7 +254,7 @@ class SelectPoller(object):
                                                output_fileno,
                                                error_fileno,
                                                SelectPoller.TIMEOUT)
-        except select.error, error:
+        except select.error as error:
             return self._handler(self.fileno, ERROR, error)
 
         # Build our events bit mask
@@ -347,7 +377,7 @@ class KQueuePoller(SelectPoller):
         events = 0
         try:
             kevents = self._kqueue.control(None, 1000, SelectPoller.TIMEOUT)
-        except OSError, error:
+        except OSError as error:
             return self._handler(self.fileno, ERROR, error)
         for event in kevents:
             if event.filter == select.KQ_FILTER_READ and READ & self.events:
@@ -402,7 +432,7 @@ class PollPoller(SelectPoller):
             LOGGER.info("Unregistering poller on fd %d" % self.fileno)
             self.update_handler(self.fileno, 0)
             self._poll.unregister(self.fileno)
-        except IOError, err:
+        except IOError as err:
             LOGGER.debug("Got IOError while shutting down poller: %s", err)
 
     def poll(self, write_only=False):
@@ -411,7 +441,10 @@ class PollPoller(SelectPoller):
         :param bool write_only: Only process write events
 
         """
-        events = self._poll.poll(int(SelectPoller.TIMEOUT * 1000))
+        try:
+            events = self._poll.poll(int(SelectPoller.TIMEOUT * 1000))
+        except select.error as error:
+            return self._handler(self.fileno, ERROR, error)
         if events:
             LOGGER.debug("Calling %s with %d events",
                          self._handler, len(events))
@@ -444,7 +477,10 @@ class EPollPoller(PollPoller):
         :param bool write_only: Only process write events
 
         """
-        events = self._poll.poll(SelectPoller.TIMEOUT)
+        try:
+            events = self._poll.poll(SelectPoller.TIMEOUT)
+        except IOError as error:
+            return self._handler(self.fileno, ERROR, error)
         if events:
             LOGGER.debug("Calling %s", self._handler)
             for fileno, event in events:

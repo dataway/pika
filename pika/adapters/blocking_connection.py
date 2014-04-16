@@ -1,13 +1,25 @@
-"""Implement a blocking, procedural style connection adapter on top of the
-asynchronous core.
+"""The blocking connection adapter module implements blocking semantics on top
+of Pika's core AMQP driver. While most of the asynchronous expectations are
+removed when using the blocking connection adapter, it attempts to remain true
+to the asynchronous RPC nature of the AMQP protocol, supporting server sent
+RPC commands.
+
+The user facing classes in the module consist of the
+:py:class:`~pika.adapters.blocking_connection.BlockingConnection`
+and the :class:`~pika.adapters.blocking_connection.BlockingChannel`
+classes.
 
 """
+import os
 import logging
 import select
 import socket
 import time
 import warnings
+import errno
+from functools import wraps
 
+from pika import frame
 from pika import callback
 from pika import channel
 from pika import exceptions
@@ -15,7 +27,24 @@ from pika import spec
 from pika import utils
 from pika.adapters import base_connection
 
+if os.name == 'java':
+    from select import cpython_compatible_select as select_function
+else:
+    from select import select as select_function
+
 LOGGER = logging.getLogger(__name__)
+
+
+def retry_on_eintr(f):
+    @wraps(f)
+    def inner(*args, **kwargs):
+        while True:
+            try:
+                return f(*args, **kwargs)
+            except select.error as e:
+                if e[0] != errno.EINTR:
+                    raise
+    return inner
 
 
 class ReadPoller(object):
@@ -26,6 +55,7 @@ class ReadPoller(object):
     """
     POLL_TIMEOUT = 10
 
+    @retry_on_eintr
     def __init__(self, fd, poll_timeout=POLL_TIMEOUT):
         """Create a new instance of the ReadPoller which wraps poll and select
         to determine if the socket has data to read on it.
@@ -36,7 +66,7 @@ class ReadPoller(object):
         """
         self.fd = fd
         self.poll_timeout = poll_timeout
-        if hasattr(select, 'poll'):
+        if hasattr(select, 'poll') and os.name != 'java':
             self.poller = select.poll()
             self.poll_events = select.POLLIN | select.POLLPRI
             self.poller.register(self.fd, self.poll_events)
@@ -44,6 +74,7 @@ class ReadPoller(object):
             self.poller = None
             self.poll_timeout = float(poll_timeout) / 1000
 
+    @retry_on_eintr
     def ready(self):
         """Check to see if the socket has data to read.
 
@@ -52,19 +83,33 @@ class ReadPoller(object):
         """
         if self.poller:
             events = self.poller.poll(self.poll_timeout)
-            return True if events else False
+            return bool(events)
         else:
-            ready, unused_wri, unused_err = select.select([self.fd], [], [],
-                                                          self.poll_timeout)
-            return len(ready) > 0
+            ready, unused_wri, unused_err = select_function([self.fd], [], [],
+                                                            self.poll_timeout)
+            return bool(ready)
 
 
 class BlockingConnection(base_connection.BaseConnection):
-    """The BlockingConnection adapter is meant for simple implementations where
-    you want to have blocking behavior. The behavior layered on top of the
-    async library. Because of the nature of AMQP there are a few callbacks
-    one needs to do, even in a blocking implementation. These include receiving
-    messages from Basic.Deliver, Basic.GetOk, and Basic.Return.
+    """The BlockingConnection creates a layer on top of Pika's asynchronous core
+    providing methods that will block until their expected response has returned.
+    Due to the asynchronous nature of the `Basic.Deliver` and `Basic.Return` calls
+    from RabbitMQ to your application, you can still implement
+    continuation-passing style asynchronous methods if you'd like to receive
+    messages from RabbitMQ using
+    :meth:`basic_consume <BlockingChannel.basic_consume>` or if you want  to be
+    notified of a delivery failure when using
+    :meth:`basic_publish <BlockingChannel.basic_publish>` .
+
+    `Basic.Get` is a blocking call which will either return the Method Frame,
+    Header Frame and Body of a message, or it will return a `Basic.GetEmpty`
+    frame as the method frame.
+
+    For more information about communicating with the blocking_connection
+    adapter, be sure to check out the
+    :class:`BlockingChannel <BlockingChannel>` class which implements the
+    :class:`Channel <pika.channel.Channel>` based communication for the
+    blocking_connection adapter.
 
     """
     WRITE_TO_READ_RATIO = 10
@@ -167,7 +212,8 @@ class BlockingConnection(base_connection.BaseConnection):
             self._close_channels(reply_code, reply_text)
         while self._has_open_channels:
             self.process_data_events()
-        self._send_connection_close(reply_code, reply_text)
+        if self.socket:
+            self._send_connection_close(reply_code, reply_text)
         while self.is_closing:
             self.process_data_events()
         if self.heartbeat:
@@ -181,8 +227,9 @@ class BlockingConnection(base_connection.BaseConnection):
 
         """
         self._set_connection_state(self.CONNECTION_INIT)
-        if not self._adapter_connect():
-            raise exceptions.AMQPConnectionError('Could not connect')
+        error = self._adapter_connect()
+        if error:
+            raise exceptions.AMQPConnectionError(error)
 
     def process_data_events(self):
         """Will make sure that data events are processed. Your app can
@@ -249,8 +296,9 @@ class BlockingConnection(base_connection.BaseConnection):
         """
         # Remove the default behavior for connection errors
         self.callbacks.remove(0, self.ON_CONNECTION_ERROR)
-        if not super(BlockingConnection, self)._adapter_connect():
-            raise exceptions.AMQPConnectionError(1)
+        error = super(BlockingConnection, self)._adapter_connect()
+        if error:
+            raise exceptions.AMQPConnectionError(error)
         self.socket.settimeout(self.SOCKET_CONNECT_TIMEOUT)
         self._frames_written_without_read = 0
         self._socket_timeouts = 0
@@ -261,7 +309,6 @@ class BlockingConnection(base_connection.BaseConnection):
             self.process_data_events()
         self.socket.settimeout(self.params.socket_timeout)
         self._set_connection_state(self.CONNECTION_OPEN)
-        return True
 
     def _adapter_disconnect(self):
         """Called if the connection is being requested to disconnect."""
@@ -291,11 +338,6 @@ class BlockingConnection(base_connection.BaseConnection):
             return False
         return self._timeouts[timeout_id]['deadline'] <= time.time()
 
-    def _handle_disconnect(self):
-        """Called internally when the socket is disconnected already"""
-        self.disconnect()
-        self._on_connection_closed(None, True)
-
     def _handle_read(self):
         """If the ReadPoller says there is data to read, try adn read it in the
         _handle_read of the parent class. Once read, reset the counter that
@@ -319,9 +361,18 @@ class BlockingConnection(base_connection.BaseConnection):
                 LOGGER.critical('Closing connection due to timeout')
             self._on_connection_closed(None, True)
 
+    def _check_state_on_disconnect(self):
+        """Checks closing corner cases to see why we were disconnected and if we should
+        raise exceptions for the anticipated exception types.
+        """
+        super(BlockingConnection, self)._check_state_on_disconnect()
+        if self.is_open:
+            # already logged a warning in the base class, now fire an exception
+            raise exceptions.ConnectionClosed()
+
     def _flush_outbound(self):
         """Flush the outbound socket buffer."""
-        if self.outbound_buffer.size > 0:
+        if self.outbound_buffer:
             try:
                 if self._handle_write():
                     self._socket_timeouts = 0
@@ -365,14 +416,32 @@ class BlockingConnection(base_connection.BaseConnection):
         """
         super(BlockingConnection, self)._send_frame(frame_value)
         self._frames_written_without_read += 1
-        if self._frames_written_without_read == self.WRITE_TO_READ_RATIO:
-            self._frames_written_without_read = 0
-            self.process_data_events()
+        if self._frames_written_without_read >= self.WRITE_TO_READ_RATIO:
+            if not isinstance(frame_value, frame.Method):
+                self._frames_written_without_read = 0
+                self.process_data_events()
 
 
 class BlockingChannel(channel.Channel):
-    """The BlockingChannel class implements a blocking layer on top of the
-    Channel class.
+    """The BlockingChannel implements blocking semantics for most things that
+    one would use callback-passing-style for with the
+    :py:class:`~pika.channel.Channel` class. In addition,
+    the `BlockingChannel` class implements a :term:`generator` that allows you
+    to :doc:`consume messages </examples/blocking_consumer_generator>` without
+    using callbacks.
+
+    Example of creating a BlockingChannel::
+
+        import pika
+
+        # Create our connection object
+        connection = pika.BlockingConnection()
+
+        # The returned object will be a blocking channel
+        channel = connection.channel()
+
+    :param BlockingConnection connection: The connection
+    :param int channel_number: The channel number for this instance
 
     """
     NO_RESPONSE_FRAMES = ['Basic.Ack', 'Basic.Reject', 'Basic.RecoverAsync']
@@ -393,6 +462,7 @@ class BlockingChannel(channel.Channel):
         self._frames = dict()
         self._replies = list()
         self._wait = False
+        self._received_response = False
         self.open()
 
     def basic_cancel(self, consumer_tag='', nowait=False):
@@ -444,7 +514,8 @@ class BlockingChannel(channel.Channel):
     def basic_publish(self, exchange, routing_key, body,
                       properties=None, mandatory=False, immediate=False):
         """Publish to the channel with the given exchange, routing key and body.
-        For more information on basic_publish and what the parameters do, see:
+        Returns a boolean value indicating the success of the operation. For 
+        more information on basic_publish and what the parameters do, see:
 
         http://www.rabbitmq.com/amqp-0-9-1-reference.html#basic.publish
 
@@ -467,6 +538,9 @@ class BlockingChannel(channel.Channel):
 
         if mandatory:
             self._response = None
+
+        if isinstance(body, unicode):
+            body = body.encode('utf-8')
 
         if self._confirmation:
             response = self._rpc(spec.Basic.Publish(exchange=exchange,
@@ -618,7 +692,7 @@ class BlockingChannel(channel.Channel):
         self._set_state(self.CLOSED)
         self._cleanup()
 
-    def consume(self, queue):
+    def consume(self, queue, no_ack=False, exclusive=False):
         """Blocking consumption of a queue instead of via a callback. This
         method is a generator that returns messages a tuple of method,
         properties, and body.
@@ -635,6 +709,10 @@ class BlockingChannel(channel.Channel):
 
         :param queue: The queue name to consume
         :type queue: str or unicode
+        :param no_ack: Tell the broker to not expect a response
+        :type no_ack: bool
+        :param exclusive: Don't allow other consumers on the queue
+        :type exclusive: bool
         :rtype: tuple(spec.Basic.Deliver, spec.BasicProperties, str or unicode)
 
         """
@@ -642,7 +720,9 @@ class BlockingChannel(channel.Channel):
         if not self._generator:
             LOGGER.debug('Issuing Basic.Consume')
             self._generator = self.basic_consume(self._generator_callback,
-                                                 queue)
+                                                 queue,
+                                                 no_ack,
+                                                 exclusive)
         while True:
             if self._generator_messages:
                 yield self._generator_messages.pop(0)
@@ -1057,7 +1137,6 @@ class BlockingChannel(channel.Channel):
                                              self._on_rpc_complete,
                                              arguments=arguments)
             replies.append(key)
-        self._received_response = False
         self._send_method(method_frame, content,
                           self._wait_on_response(method_frame))
         if force_data_events and self._force_data_events_override is not False:
@@ -1070,24 +1149,20 @@ class BlockingChannel(channel.Channel):
 
         :param pika.amqp_object.Method method_frame: The method frame to send
         :param content: The content to send
-        :type content: str or tuple
+        :type content: tuple
         :param bool wait: Wait for a response
 
         """
         self.wait = wait
+        prev_received_response = self._received_response
         self._received_response = False
-        LOGGER.debug('Connection: %r', self.connection)
         self.connection.send_method(self.channel_number, method_frame, content)
-        while self.connection.outbound_buffer.size > 0:
-            try:
-                self.connection.process_data_events()
-            except exceptions.AMQPConnectionError:
-                break
         while wait and not self._received_response:
             try:
                 self.connection.process_data_events()
             except exceptions.AMQPConnectionError:
                 break
+        self._received_response = prev_received_response
 
     def _validate_acceptable_replies(self, acceptable_replies):
         """Validate the list of acceptable replies
